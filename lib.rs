@@ -52,7 +52,10 @@
 extern crate slog;
 extern crate thread_local;
 extern crate take_mut;
+extern crate may;
 
+
+use may::sync::{mpsc, Mutex, MutexGuard};
 use slog::{Record, RecordStatic, Level, SingleKV, KV, BorrowedKV};
 use slog::{Serializer, OwnedKVList, Key};
 
@@ -60,11 +63,10 @@ use slog::Drain;
 use std::{io, thread};
 use std::error::Error;
 use std::fmt;
-use std::sync;
-
-use std::sync::{mpsc, Mutex};
+// use std::sync;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::SendError;
 use take_mut::take;
 // }}}
 
@@ -178,8 +180,8 @@ pub enum AsyncError {
     Fatal(Box<std::error::Error>),
 }
 
-impl<T> From<mpsc::TrySendError<T>> for AsyncError {
-    fn from(_: mpsc::TrySendError<T>) -> AsyncError {
+impl<T> From<SendError<T>> for AsyncError {
+    fn from(_: SendError<T>) -> AsyncError {
         AsyncError::Full
     }
 }
@@ -208,32 +210,21 @@ pub struct AsyncCoreBuilder<D>
 where
     D: slog::Drain<Err = slog::Never, Ok = ()> + Send + 'static,
 {
-    chan_size: usize,
     drain: D,
 }
 
 impl<D> AsyncCoreBuilder<D>
 where
-    D: slog::Drain<Err = slog::Never, Ok = ()> + Send + 'static,
+    D: slog::Drain<Err = slog::Never, Ok = ()>
+        + Send
+        + 'static,
 {
     fn new(drain: D) -> Self {
-        AsyncCoreBuilder {
-            chan_size: 128,
-            drain: drain,
-        }
+        AsyncCoreBuilder { drain: drain }
     }
 
-    /// Set channel size used to send logging records to worker thread. When
-    /// buffer is full `AsyncCore` will start returning `AsyncError::Full`.
-    pub fn chan_size(mut self, s: usize) -> Self {
-        self.chan_size = s;
-        self
-    }
-
-    fn spawn_thread(
-        self,
-    ) -> (thread::JoinHandle<()>, mpsc::SyncSender<AsyncMsg>) {
-        let (tx, rx) = mpsc::sync_channel(self.chan_size);
+    fn spawn_thread(self) -> (thread::JoinHandle<()>, mpsc::Sender<AsyncMsg>) {
+        let (tx, rx) = mpsc::channel();
         let join = thread::spawn(move || loop {
             match rx.recv().unwrap() {
                 AsyncMsg::Record(r) => {
@@ -315,7 +306,7 @@ pub struct AsyncGuard {
     // Should always be `Some`. `None` only
     // after `drop`
     join: Option<thread::JoinHandle<()>>,
-    tx: mpsc::SyncSender<AsyncMsg>,
+    tx: mpsc::Sender<AsyncMsg>,
 }
 
 impl Drop for AsyncGuard {
@@ -347,8 +338,8 @@ impl Drop for AsyncGuard {
 /// handling all previous `Record`s sent to it). If you can't tolerate the
 /// delay, make sure you drop it eg. in another thread.
 pub struct AsyncCore {
-    ref_sender: Mutex<mpsc::SyncSender<AsyncMsg>>,
-    tl_sender: thread_local::ThreadLocal<mpsc::SyncSender<AsyncMsg>>,
+    ref_sender: Mutex<mpsc::Sender<AsyncMsg>>,
+    tl_sender: thread_local::ThreadLocal<mpsc::Sender<AsyncMsg>>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -367,24 +358,25 @@ impl AsyncCore {
         D: slog::Drain<Err = slog::Never, Ok = ()> + Send + 'static,
     >(
         drain: D,
-    ) -> AsyncCoreBuilder<D> {
+) -> AsyncCoreBuilder<D>{
         AsyncCoreBuilder::new(drain)
     }
     fn get_sender(
         &self,
     ) -> Result<
-        &mpsc::SyncSender<AsyncMsg>,
-        std::sync::PoisonError<sync::MutexGuard<mpsc::SyncSender<AsyncMsg>>>,
+        &mpsc::Sender<AsyncMsg>,
+        std::sync::PoisonError<MutexGuard<mpsc::Sender<AsyncMsg>>>,
     > {
-        self.tl_sender
-            .get_or_try(|| Ok(Box::new(self.ref_sender.lock()?.clone())))
+        self.tl_sender.get_or_try(|| {
+            Ok(Box::new(self.ref_sender.lock()?.clone()))
+        })
     }
 
     /// Send `AsyncRecord` to a worker thread.
     fn send(&self, r: AsyncRecord) -> AsyncResult<()> {
         let sender = self.get_sender()?;
 
-        sender.try_send(AsyncMsg::Record(r))?;
+        sender.send(AsyncMsg::Record(r))?;
 
         Ok(())
     }
@@ -401,10 +393,9 @@ impl Drain for AsyncCore {
     ) -> AsyncResult<()> {
 
         let mut ser = ToSendSerializer::new();
-        record
-            .kv()
-            .serialize(record, &mut ser)
-            .expect("`ToSendSerializer` can't fail");
+        record.kv().serialize(record, &mut ser).expect(
+            "`ToSendSerializer` can't fail",
+        );
 
         self.send(AsyncRecord {
             msg: fmt::format(*record.msg()),
@@ -472,11 +463,11 @@ where
 
     /// Set channel size used to send logging records to worker thread. When
     /// buffer is full `AsyncCore` will start returning `AsyncError::Full`.
-    pub fn chan_size(self, s: usize) -> Self {
-        AsyncBuilder {
-            core: self.core.chan_size(s),
-        }
-    }
+    // pub fn chan_size(self, s: usize) -> Self {
+    //     AsyncBuilder {
+    //         core: self.core.chan_size(s),
+    //     }
+    // }
 
     /// Complete building `Async`
     pub fn build(self) -> Async {
@@ -541,7 +532,7 @@ impl Async {
         D: slog::Drain<Err = slog::Never, Ok = ()> + Send + 'static,
     >(
         drain: D,
-    ) -> Self {
+) -> Self{
         AsyncBuilder::new(drain).build()
     }
 
