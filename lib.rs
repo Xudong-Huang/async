@@ -50,20 +50,17 @@
 
 #[macro_use]
 extern crate slog;
-extern crate thread_local;
 extern crate take_mut;
 extern crate may;
 
-
-use may::sync::{mpsc, Mutex, MutexGuard};
-use slog::{Record, RecordStatic, Level, SingleKV, KV, BorrowedKV};
-use slog::{Serializer, OwnedKVList, Key};
+use may::sync::{mpsc, Mutex};
+use slog::{Serializer, OwnedKVList, Key, Record, RecordStatic, Level,
+           SingleKV, KV, BorrowedKV};
 
 use slog::Drain;
 use std::{io, thread};
 use std::error::Error;
 use std::fmt;
-// use std::sync;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SendError;
@@ -191,7 +188,6 @@ impl<T> From<std::sync::TryLockError<T>> for AsyncError {
     }
 }
 
-
 impl<T> From<std::sync::PoisonError<T>> for AsyncError {
     fn from(err: std::sync::PoisonError<T>) -> AsyncError {
         AsyncError::Fatal(Box::new(
@@ -233,7 +229,6 @@ where
                         level: r.level,
                         tag: &r.tag,
                     };
-
                     self.drain
                         .log(
                             &Record::new(
@@ -262,8 +257,7 @@ where
         let (join, tx) = self.spawn_thread();
 
         AsyncCore {
-            ref_sender: Mutex::new(tx),
-            tl_sender: thread_local::ThreadLocal::new(),
+            ref_sender: tx,
             join: Mutex::new(Some(join)),
         }
     }
@@ -276,8 +270,7 @@ where
 
         (
             AsyncCore {
-                ref_sender: Mutex::new(tx.clone()),
-                tl_sender: thread_local::ThreadLocal::new(),
+                ref_sender: tx.clone(),
                 join: Mutex::new(None),
             },
             AsyncGuard {
@@ -338,8 +331,7 @@ impl Drop for AsyncGuard {
 /// handling all previous `Record`s sent to it). If you can't tolerate the
 /// delay, make sure you drop it eg. in another thread.
 pub struct AsyncCore {
-    ref_sender: Mutex<mpsc::Sender<AsyncMsg>>,
-    tl_sender: thread_local::ThreadLocal<mpsc::Sender<AsyncMsg>>,
+    ref_sender: mpsc::Sender<AsyncMsg>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -361,20 +353,14 @@ impl AsyncCore {
 ) -> AsyncCoreBuilder<D>{
         AsyncCoreBuilder::new(drain)
     }
-    fn get_sender(
-        &self,
-    ) -> Result<
-        &mpsc::Sender<AsyncMsg>,
-        std::sync::PoisonError<MutexGuard<mpsc::Sender<AsyncMsg>>>,
-    > {
-        self.tl_sender.get_or_try(|| {
-            Ok(Box::new(self.ref_sender.lock()?.clone()))
-        })
+
+    fn get_sender(&self) -> &mpsc::Sender<AsyncMsg> {
+        &self.ref_sender
     }
 
     /// Send `AsyncRecord` to a worker thread.
     fn send(&self, r: AsyncRecord) -> AsyncResult<()> {
-        let sender = self.get_sender()?;
+        let sender = self.get_sender();
 
         sender.send(AsyncMsg::Record(r))?;
 
@@ -427,14 +413,13 @@ impl Drop for AsyncCore {
         let _err: Result<(), Box<std::error::Error>> = {
             || {
                 if let Some(join) = self.join.lock()?.take() {
-                    let _ = self.get_sender()?.send(AsyncMsg::Finish);
+                    let _ = self.get_sender().send(AsyncMsg::Finish);
                     join.join().map_err(|_| {
                         io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "Logging thread worker join error",
                         )
                     })?;
-
                 }
                 Ok(())
             }
